@@ -36,6 +36,7 @@ fn main() -> iced::Result {
 struct Player {
     tracks: Vec<Track>,
     current_queue: Vec<Track>,
+    current_track_idx: Option<usize>,
     sender: Sender<Command>,
 }
 
@@ -50,6 +51,8 @@ enum Message {
     Loaded(Result<Vec<Track>, LoadError>),
     TrackMessage(usize, TrackMessage),
     ToggleTrack,
+    JumpToNext,
+    JumpToPrev,
     Err(Result<(), String>),
 }
 
@@ -71,7 +74,7 @@ impl Player {
                         println!("Total duration = {dur:#?}");
                         sink.stop();
                         sink.append(source);
-                    },
+                    }
                     Command::ToggleTrack => {
                         if sink.is_paused() {
                             sink.play();
@@ -92,6 +95,7 @@ impl Player {
         let player = Player {
             tracks: vec![],
             current_queue: vec![],
+            current_track_idx: None,
             sender: tx,
         };
 
@@ -122,6 +126,7 @@ impl Player {
                             let sender = self.sender.clone();
 
                             println!("Track played");
+                            self.current_track_idx = Some(i);
                             Task::perform(
                                 async move {
                                     let _ = sender.send(Command::Play(path)).await;
@@ -145,6 +150,66 @@ impl Player {
                     |_| (),
                 )
                 .discard()
+            }
+            Message::JumpToNext => {
+                let sender = self.sender.clone();
+                let idx = if let Some(idx) = self.current_track_idx.unwrap().checked_add(1) {
+                    idx
+                } else {
+                    0
+                };
+
+                if let Some(prev_track) = self.tracks.get(idx) {
+                    let path = prev_track.path.clone();
+                    self.current_track_idx = Some(idx);
+                    Task::perform(
+                        async move {
+                            let _ = sender.send(Command::Play(path)).await;
+                        },
+                        |_| (),
+                    )
+                    .discard()
+                } else {
+                    let path = self.tracks[0].path.clone();
+                    self.current_track_idx = Some(0);
+                    Task::perform(
+                        async move {
+                            let _ = sender.send(Command::Play(path)).await;
+                        },
+                        |_| (),
+                    )
+                    .discard()
+                }
+            }
+            Message::JumpToPrev => {
+                let sender = self.sender.clone();
+                let idx = if let Some(idx) = self.current_track_idx.unwrap().checked_add(1) {
+                    idx
+                } else {
+                    self.tracks.len() - 1
+                };
+
+                if let Some(prev_track) = self.tracks.get(idx) {
+                    let path = prev_track.path.clone();
+                    self.current_track_idx = Some(idx);
+                    Task::perform(
+                        async move {
+                            let _ = sender.send(Command::Play(path)).await;
+                        },
+                        |_| (),
+                    )
+                    .discard()
+                } else {
+                    let path = self.tracks[self.tracks.len() - 1].path.clone();
+                    self.current_track_idx = Some(self.tracks.len() - 1);
+                    Task::perform(
+                        async move {
+                            let _ = sender.send(Command::Play(path)).await;
+                        },
+                        |_| (),
+                    )
+                    .discard()
+                }
             }
             Message::Err(res) => {
                 println!("{res:#?}");
@@ -172,9 +237,15 @@ impl Player {
                 .into()
         };
 
-        let control =
-            container(row![button("<"), button("||").on_press(Message::ToggleTrack), button(">")].spacing(50))
-                .center_x(Fill);
+        let control = container(
+            row![
+                button("<").on_press(Message::JumpToPrev),
+                button("||").on_press(Message::ToggleTrack),
+                button(">").on_press(Message::JumpToNext),
+            ]
+            .spacing(50),
+        )
+        .center_x(Fill);
         let content = column![tracks, control].padding([10, 20]);
         container(content).width(Fill).height(Fill).into()
     }
