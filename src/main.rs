@@ -42,13 +42,14 @@ struct Player {
 #[derive(Debug, Clone)]
 enum Command {
     Play(PathBuf),
+    ToggleTrack,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     Loaded(Result<Vec<Track>, LoadError>),
     TrackMessage(usize, TrackMessage),
-
+    ToggleTrack,
     Err(Result<(), String>),
 }
 
@@ -70,6 +71,15 @@ impl Player {
                         println!("Total duration = {dur:#?}");
                         sink.stop();
                         sink.append(source);
+                    },
+                    Command::ToggleTrack => {
+                        if sink.is_paused() {
+                            sink.play();
+                            println!("Track resumed");
+                        } else {
+                            sink.pause();
+                            println!("Track paused");
+                        }
                     }
                 };
 
@@ -120,11 +130,21 @@ impl Player {
                             )
                             .discard()
                         }
-                        _ => Task::none()
+                        _ => Task::none(),
                     }
                 } else {
                     Task::none()
                 }
+            }
+            Message::ToggleTrack => {
+                let sender = self.sender.clone();
+                Task::perform(
+                    async move {
+                        let _ = sender.send(Command::ToggleTrack).await;
+                    },
+                    |_| (),
+                )
+                .discard()
             }
             Message::Err(res) => {
                 println!("{res:#?}");
@@ -153,7 +173,8 @@ impl Player {
         };
 
         let control =
-            container(row![button("<").on_press(on_press), button("||"), button(">")].spacing(50)).center_x(Fill);
+            container(row![button("<"), button("||").on_press(Message::ToggleTrack), button(">")].spacing(50))
+                .center_x(Fill);
         let content = column![tracks, control].padding([10, 20]);
         container(content).width(Fill).height(Fill).into()
     }
