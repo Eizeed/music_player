@@ -2,14 +2,16 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
-use iced::widget::{button, center, column, container, keyed_column, row, text};
+use iced::widget::{button, center, column, container, keyed_column, progress_bar, row, text};
 use iced::Length::Fill;
-use iced::{window, Element, Task};
+use iced::{time, window, Element, Subscription, Task};
 use lofty::file::AudioFile;
 use lofty::probe::Probe;
 use rodio::{OutputStream, Sink, Source};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, Sender};
 use uuid::Uuid;
 
@@ -30,14 +32,17 @@ fn main() -> iced::Result {
         .window(window::Settings {
             ..Default::default()
         })
+        .subscription(Player::subscription)
         .run_with(Player::new)
 }
 
 struct Player {
     tracks: Vec<Track>,
     current_queue: Vec<Track>,
+    current_pos: Duration,
     current_track_idx: Option<usize>,
     sender: Sender<Command>,
+    timer: DurationBar,
 }
 
 #[derive(Debug, Clone)]
@@ -50,10 +55,23 @@ enum Command {
 enum Message {
     Loaded(Result<Vec<Track>, LoadError>),
     TrackMessage(usize, TrackMessage),
+    StartTrack(Result<(), SendError<Command>>),
     ToggleTrack,
     JumpToNext,
     JumpToPrev,
+    PlayNext(Instant),
+    Tick(Instant),
     Err(Result<(), String>),
+}
+
+#[derive(Debug, Clone, Default)]
+enum DurationBar {
+    #[default]
+    Idle,
+    Paused,
+    Ticking {
+        last_tick: Instant,
+    },
 }
 
 impl Player {
@@ -73,6 +91,7 @@ impl Player {
 
                         println!("Total duration = {dur:#?}");
                         sink.stop();
+                        sink.play();
                         sink.append(source);
                     }
                     Command::ToggleTrack => {
@@ -96,6 +115,8 @@ impl Player {
             tracks: vec![],
             current_queue: vec![],
             current_track_idx: None,
+            current_pos: Duration::default(),
+            timer: DurationBar::default(),
             sender: tx,
         };
 
@@ -116,8 +137,6 @@ impl Player {
             Message::Loaded(Err(_err)) => Task::none(),
             Message::TrackMessage(i, track_message) => {
                 if let Some(track) = self.tracks.get_mut(i) {
-                    println!("{i}");
-
                     match track_message {
                         TrackMessage::PlayTrack => {
                             let _ = track.update(track_message);
@@ -125,15 +144,17 @@ impl Player {
                             let path = track.path.clone();
                             let sender = self.sender.clone();
 
+                            self.current_pos = Duration::default();
+
                             println!("Track played");
                             self.current_track_idx = Some(i);
                             Task::perform(
                                 async move {
                                     let _ = sender.send(Command::Play(path)).await;
+                                    Ok(())
                                 },
-                                |_| (),
+                                Message::StartTrack,
                             )
-                            .discard()
                         }
                         _ => Task::none(),
                     }
@@ -141,7 +162,60 @@ impl Player {
                     Task::none()
                 }
             }
+            Message::PlayNext(_) => {
+                let next_track = self.current_track_idx.unwrap() + 1;
+                self.timer = DurationBar::Ticking {
+                    last_tick: Instant::now(),
+                };
+
+                self.current_pos = Duration::default();
+
+                let sender = self.sender.clone();
+                if next_track > self.tracks.len() - 1 {
+                    self.current_track_idx = Some(0);
+                    let path = self.tracks[0].path.clone();
+                    Task::perform(
+                        async move {
+                            let _ = sender.send(Command::Play(path)).await;
+                            return Ok(());
+                        },
+                        Message::StartTrack,
+                    )
+                    .discard()
+                } else {
+                    self.current_track_idx = Some(next_track);
+                    let path = self.tracks[next_track].path.clone();
+                    Task::perform(
+                        async move {
+                            let _ = sender.send(Command::Play(path)).await;
+                        },
+                        |_| Message::StartTrack,
+                    )
+                    .discard()
+                }
+            }
+            Message::StartTrack(res) => {
+                println!("New track started");
+                println!("-----------------");
+                println!("Timer was set to: {:#?}", self.timer);
+                self.timer = DurationBar::Ticking {
+                    last_tick: Instant::now(),
+                };
+                self.current_pos = Duration::default();
+                println!("current_pos is flushed: {:#?}", self.current_pos);
+                println!("Timer now set to: {:#?}", self.timer);
+                println!("-----------------");
+                Task::none()
+            }
             Message::ToggleTrack => {
+                if let DurationBar::Paused = self.timer {
+                    self.timer = DurationBar::Ticking {
+                        last_tick: Instant::now(),
+                    };
+                } else if let DurationBar::Ticking { .. } = self.timer {
+                    self.timer = DurationBar::Paused;
+                }
+
                 let sender = self.sender.clone();
                 Task::perform(
                     async move {
@@ -165,25 +239,25 @@ impl Player {
                     Task::perform(
                         async move {
                             let _ = sender.send(Command::Play(path)).await;
+                            Ok(())
                         },
-                        |_| (),
+                        Message::StartTrack,
                     )
-                    .discard()
                 } else {
                     let path = self.tracks[0].path.clone();
                     self.current_track_idx = Some(0);
                     Task::perform(
                         async move {
                             let _ = sender.send(Command::Play(path)).await;
+                            Ok(())
                         },
-                        |_| (),
+                        Message::StartTrack,
                     )
-                    .discard()
                 }
             }
             Message::JumpToPrev => {
                 let sender = self.sender.clone();
-                let idx = if let Some(idx) = self.current_track_idx.unwrap().checked_add(1) {
+                let idx = if let Some(idx) = self.current_track_idx.unwrap().checked_sub(1) {
                     idx
                 } else {
                     self.tracks.len() - 1
@@ -195,21 +269,29 @@ impl Player {
                     Task::perform(
                         async move {
                             let _ = sender.send(Command::Play(path)).await;
+                            Ok(())
                         },
-                        |_| (),
+                        Message::StartTrack,
                     )
-                    .discard()
                 } else {
                     let path = self.tracks[self.tracks.len() - 1].path.clone();
                     self.current_track_idx = Some(self.tracks.len() - 1);
                     Task::perform(
                         async move {
                             let _ = sender.send(Command::Play(path)).await;
+                            Ok(())
                         },
-                        |_| (),
+                        Message::StartTrack,
                     )
-                    .discard()
                 }
+            }
+            Message::Tick(now) => {
+                if let DurationBar::Ticking { last_tick } = &mut self.timer {
+                    self.current_pos += now - *last_tick;
+                    *last_tick = now;
+                    // println!("now {:#?}", self.current_pos);
+                }
+                Task::none()
             }
             Message::Err(res) => {
                 println!("{res:#?}");
@@ -237,17 +319,43 @@ impl Player {
                 .into()
         };
 
-        let control = container(
+        let mut dur = 0.0;
+        if let Some(idx) = self.current_track_idx {
+            let track = &self.tracks[idx];
+            dur = track.duration.as_secs_f32();
+        } else {
+            ()
+        };
+
+        let control = container(column![
+            progress_bar(0.0..=dur, self.current_pos.as_secs_f32()),
             row![
                 button("<").on_press(Message::JumpToPrev),
                 button("||").on_press(Message::ToggleTrack),
                 button(">").on_press(Message::JumpToNext),
             ]
             .spacing(50),
-        )
+        ])
         .center_x(Fill);
         let content = column![tracks, control].padding([10, 20]);
         container(content).width(Fill).height(Fill).into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let tick = match self.timer {
+            DurationBar::Idle | DurationBar::Paused => Subscription::none(),
+            DurationBar::Ticking { .. } => {
+                let idx = self.current_track_idx.unwrap();
+                let dur = &self.tracks[idx].duration;
+                if *dur <= self.current_pos {
+                    time::every(Duration::from_millis(10)).map(Message::PlayNext)
+                } else {
+                    time::every(Duration::from_millis(10)).map(Message::Tick)
+                }
+            }
+        };
+
+        Subscription::batch(vec![tick])
     }
 }
 
