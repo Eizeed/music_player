@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt::Debug;
 use std::fs::File;
@@ -39,7 +40,7 @@ fn main() -> iced::Result {
 
 struct Player {
     tracks: Vec<Track>,
-    current_queue: Vec<Track>,
+    queue: VecDeque<Track>,
     current_pos: Duration,
     current_track_idx: Option<usize>,
     sender: Sender<Command>,
@@ -60,6 +61,7 @@ enum Message {
     ToggleTrack,
     JumpToNext,
     JumpToPrev,
+    AddToQueue(usize),
     Tick(Instant),
     Err(Result<(), String>),
 }
@@ -111,7 +113,7 @@ impl Player {
 
         let player = Player {
             tracks: vec![],
-            current_queue: vec![],
+            queue: VecDeque::default(),
             current_track_idx: None,
             current_pos: Duration::default(),
             timer: DurationBar::default(),
@@ -137,9 +139,13 @@ impl Player {
                 if let Some(track) = self.tracks.get_mut(i) {
                     match track_message {
                         TrackMessage::PlayTrack => {
-                            let path = track.path.clone();
                             let _ = track.update(track_message);
+                            let path = track.path.clone();
                             Task::perform(async move { return (path, i) }, Message::PlayTrack)
+                        }
+                        TrackMessage::AddToQueue => {
+                            let _ = track.update(track_message);
+                            Task::perform(async move { return i }, Message::AddToQueue)
                         }
                         TrackMessage::TrackEnd(_) => Task::none(),
                     }
@@ -155,11 +161,18 @@ impl Player {
                     last_tick: Instant::now(),
                 };
 
+                let track_path;
+                if self.queue.len() > 0 {
+                    track_path = self.queue[0].path.clone();
+                } else {
+                    self.current_track_idx = Some(idx);
+                    track_path = path;
+                }
+
                 println!("Track played");
-                self.current_track_idx = Some(idx);
                 Task::perform(
                     async move {
-                        let _ = sender.send(Command::Play(path)).await;
+                        let _ = sender.send(Command::Play(track_path)).await;
                     },
                     |_| (),
                 )
@@ -167,7 +180,7 @@ impl Player {
             }
             Message::ToggleTrack => {
                 if let None = self.current_track_idx {
-                    return Task::none()
+                    return Task::none();
                 }
 
                 if let DurationBar::Paused = self.timer {
@@ -189,7 +202,11 @@ impl Player {
             }
             Message::JumpToNext => {
                 if let None = self.current_track_idx {
-                    return Task::none()
+                    return Task::none();
+                }
+
+                if self.queue.len() > 0 {
+                    self.queue.pop_front();
                 }
 
                 let idx;
@@ -211,7 +228,7 @@ impl Player {
             }
             Message::JumpToPrev => {
                 if let None = self.current_track_idx {
-                    return Task::none()
+                    return Task::none();
                 }
 
                 let idx = if let Some(idx) = self.current_track_idx.unwrap().checked_sub(1) {
@@ -230,13 +247,24 @@ impl Player {
                     Message::PlayTrack,
                 )
             }
+            Message::AddToQueue(idx) => {
+                let track = self.tracks[idx].clone();
+                self.queue.push_back(track);
+                if let None = self.current_track_idx {
+                    self.current_track_idx = Some(idx);
+                }
+                Task::none()
+            }
             Message::Tick(now) => {
                 if let DurationBar::Ticking { last_tick } = &mut self.timer {
-                    let dur = self
-                        .tracks
-                        .get(self.current_track_idx.unwrap())
-                        .unwrap()
-                        .duration;
+                    let dur = if self.queue.len() > 0 {
+                        self.queue[0].duration
+                    } else {
+                        self.tracks
+                            .get(self.current_track_idx.unwrap())
+                            .unwrap()
+                            .duration
+                    };
 
                     if self.current_pos >= dur {
                         return Task::perform(async move { () }, |_| Message::JumpToNext);
