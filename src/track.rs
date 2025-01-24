@@ -1,6 +1,6 @@
 use std::{path::{Path, PathBuf}, time::Duration};
 
-use iced::{widget::{button, row, text}, Element, Length, Task};
+use iced::{widget::{button, horizontal_space, row, text}, Element, Length, Task};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ pub struct Track {
 #[derive(Debug, Clone)]
 pub enum TrackMessage {
     PlayTrack,
+    AddToQueue,
     TrackEnd(Result<(), String>),
 }
 
@@ -29,6 +30,10 @@ impl Track {
                 println!("{path:#?}");
                 Task::none()
             },
+            TrackMessage::AddToQueue => {
+                println!("Added to queue");
+                Task::none()
+            }
             TrackMessage::TrackEnd(_res) => {
                 Task::none()
             }
@@ -40,7 +45,11 @@ impl Track {
         let duration = text(&self.duration_str).width(Length::FillPortion(1));
 
         let content = row![name, duration];
-        let track = button(content).on_press(TrackMessage::PlayTrack).into();
+        let track_data = button(content).on_press(TrackMessage::PlayTrack);
+
+        let add_button = button("+").on_press(TrackMessage::AddToQueue);
+
+        let track = row![track_data, horizontal_space(), add_button].into();
 
         return track;
     }
