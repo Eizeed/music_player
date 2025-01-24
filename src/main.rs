@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::env;
 use std::ffi::OsString;
 use std::fmt::Debug;
 use std::fs::File;
@@ -6,6 +7,10 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+use player::models::playlist_model::PlaylistModel;
+use sqlx::pool::PoolOptions;
+use sqlx::SqlitePool;
 
 use iced::widget::{button, center, column, container, keyed_column, progress_bar, row, text};
 use iced::Length::Fill;
@@ -17,12 +22,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Sender};
 use uuid::Uuid;
 
-mod track;
-use crate::track::*;
+use player::{db, track::*};
 
 pub const HOME_PATH: &str = "/home/lf/Music";
 
 fn main() -> iced::Result {
+    dotenvy::dotenv().ok();
     // Make config with its config file
     let path = PathBuf::from_str(HOME_PATH).unwrap();
 
@@ -39,12 +44,15 @@ fn main() -> iced::Result {
 }
 
 struct Player {
-    tracks: Vec<Track>,
-    queue: VecDeque<Track>,
-    current_pos: Duration,
+    tracks: Vec<Track>,          // All tracks found in system
+    queue: Vec<Track>,           // All tracks OR tracks from playlist
+    prio_queue: VecDeque<Track>, // Tracks added by user
+    playlists: Vec<PlaylistModel>,
+    current_pos: Duration, // Current time pos of track
     current_track_idx: Option<usize>,
     sender: Sender<Command>,
     timer: DurationBar,
+    db_pool: SqlitePool,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +63,7 @@ enum Command {
 
 #[derive(Debug, Clone)]
 enum Message {
-    Loaded(Result<Vec<Track>, LoadError>),
+    Loaded(Result<SavedState, LoadError>),
     TrackMessage(usize, TrackMessage),
     PlayTrack((PathBuf, usize)),
     ToggleTrack,
@@ -111,16 +119,35 @@ impl Player {
             dbg!("Engine died")
         });
 
+        if let None = env::var("DATABASE_URL").ok() {
+            env::set_var("DATABASE_URL", "sqlite://db.sql");
+        }
+
+        let connection_string = env::var("DATABASE_URL").unwrap();
+
+        let db_pool = PoolOptions::new()
+            .max_connections(5)
+            .connect_lazy(&connection_string)
+            .expect("SQLite doesn't work");
+
         let player = Player {
             tracks: vec![],
-            queue: VecDeque::default(),
+            queue: vec![],
+            playlists: vec![],
+            prio_queue: VecDeque::default(),
             current_track_idx: None,
             current_pos: Duration::default(),
             timer: DurationBar::default(),
             sender: tx,
+            db_pool,
         };
 
-        (player, Task::perform(SavedState::load(), Message::Loaded))
+        let pool = player.db_pool.clone();
+
+        (
+            player,
+            Task::perform(SavedState::load(pool), Message::Loaded),
+        )
     }
 
     fn title(&self) -> String {
@@ -129,8 +156,9 @@ impl Player {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Loaded(Ok(tracks)) => {
-                self.tracks = tracks;
+            Message::Loaded(Ok(state)) => {
+                self.tracks = state.tracks;
+                self.playlists = state.playlists;
 
                 Task::none()
             }
@@ -205,8 +233,8 @@ impl Player {
                     return Task::none();
                 }
 
-                if self.queue.len() > 0 {
-                    self.queue.pop_front();
+                if self.prio_queue.len() > 0 {
+                    self.prio_queue.pop_front();
                 }
 
                 let idx;
@@ -249,7 +277,7 @@ impl Player {
             }
             Message::AddToQueue(idx) => {
                 let track = self.tracks[idx].clone();
-                self.queue.push_back(track);
+                self.prio_queue.push_back(track);
                 if let None = self.current_track_idx {
                     self.current_track_idx = Some(idx);
                 }
@@ -343,19 +371,25 @@ pub enum LoadError {
     Format,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SavedState {
     tracks: Vec<Track>,
+    playlists: Vec<PlaylistModel>,
 }
 
 impl SavedState {
-    pub async fn load() -> Result<Vec<Track>, LoadError> {
-        let mut tracks = vec![];
+    pub async fn load(pool: SqlitePool) -> Result<SavedState, LoadError> {
+        let mut tracks: Vec<Track> = vec![];
         let mut paths = vec![];
         Self::visit_dir(&mut paths, HOME_PATH.into());
 
-        for path in paths {
-            let track_metadata = Probe::open(&path)
+        db::init(&pool).await;
+        db::update_track_state(&pool, &paths).await;
+        let track_md_vec = db::get_tracks(&pool).await;
+        let playlists = db::get_playlists(&pool).await;
+
+        for track in track_md_vec {
+            let track_metadata = Probe::open(&track.path)
                 .map_err(|_| LoadError::File)?
                 .read()
                 .map_err(|_| LoadError::File)?;
@@ -363,16 +397,20 @@ impl SavedState {
             let duration = track_metadata.properties().duration();
             let duration_str = format!("{}:{}", duration.as_secs() / 60, duration.as_secs() % 60);
 
+            let uuid = Uuid::from_str(&track.uuid).unwrap();
+            let path = PathBuf::from_str(&track.path).unwrap();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+
             tracks.push(Track {
-                uuid: Uuid::new_v4(),
-                name: path.file_name().unwrap().to_str().unwrap().to_string(),
+                uuid,
+                name,
                 duration_str,
                 duration,
                 path,
             });
         }
 
-        return Ok(tracks);
+        Ok(SavedState { tracks, playlists })
     }
 
     fn visit_dir(paths: &mut Vec<PathBuf>, dir: PathBuf) {
