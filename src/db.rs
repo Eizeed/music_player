@@ -133,3 +133,37 @@ pub async fn get_playlists(pool: &SqlitePool) -> Vec<PlaylistModel> {
 
     return playlists;
 }
+
+pub async fn get_tracks_from_playlist(pool: &SqlitePool, playlist_uuid: Uuid) -> Vec<TrackModel> {
+    let mut transaction = pool.begin().await.unwrap();
+    let playlist = sqlx::query_as!(
+        PlaylistModel,
+        r#"
+            SELECT uuid, title, tracks AS "tracks: Value" FROM playlists WHERE uuid = $1 
+        "#,
+        playlist_uuid
+    )
+    .fetch_one(transaction.as_mut())
+    .await
+    .unwrap();
+
+    let uuids: Vec<Uuid> = serde_json::from_value(playlist.tracks).unwrap();
+
+    let mut tracks: Vec<TrackModel> = vec![];
+
+    for uuid in uuids {
+        let track = sqlx::query_as!(
+            TrackModel,
+            r#"
+                SELECT * FROM tracks WHERE uuid = $1
+            "#,
+            uuid
+        ).fetch_one(transaction.as_mut()).await.unwrap();
+
+        tracks.push(track);
+    };
+
+    transaction.commit().await.unwrap();
+
+    return tracks;
+}

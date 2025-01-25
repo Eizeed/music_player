@@ -52,6 +52,7 @@ struct Player {
     current_track_idx: Option<usize>,
     sender: Sender<Command>,
     timer: DurationBar,
+    playlist: Option<PlaylistModel>,
     db_pool: SqlitePool,
 }
 
@@ -66,10 +67,12 @@ enum Message {
     Loaded(Result<SavedState, LoadError>),
     TrackMessage(usize, TrackMessage),
     PlayTrack((PathBuf, usize)),
+    ChooseTrack((PathBuf, usize)),
     ToggleTrack,
     JumpToNext,
     JumpToPrev,
     AddToQueue(usize),
+    SetQueue(Result<Vec<Track>, String>),
     Tick(Instant),
     Err(Result<(), String>),
 }
@@ -138,6 +141,7 @@ impl Player {
             current_track_idx: None,
             current_pos: Duration::default(),
             timer: DurationBar::default(),
+            playlist: None,
             sender: tx,
             db_pool,
         };
@@ -159,17 +163,18 @@ impl Player {
             Message::Loaded(Ok(state)) => {
                 self.tracks = state.tracks;
                 self.playlists = state.playlists;
+                self.queue = self.tracks.clone();
 
                 Task::none()
             }
             Message::Loaded(Err(_err)) => Task::none(),
             Message::TrackMessage(i, track_message) => {
-                if let Some(track) = self.tracks.get_mut(i) {
+                if let Some(track) = self.queue.get_mut(i) {
                     match track_message {
-                        TrackMessage::PlayTrack => {
+                        TrackMessage::ChooseTrack => {
                             let _ = track.update(track_message);
                             let path = track.path.clone();
-                            Task::perform(async move { return (path, i) }, Message::PlayTrack)
+                            Task::perform(async move { return (path, i) }, Message::ChooseTrack)
                         }
                         TrackMessage::AddToQueue => {
                             let _ = track.update(track_message);
@@ -190,8 +195,8 @@ impl Player {
                 };
 
                 let track_path;
-                if self.queue.len() > 0 {
-                    track_path = self.queue[0].path.clone();
+                if self.prio_queue.len() > 0 {
+                    track_path = self.prio_queue[0].path.clone();
                 } else {
                     self.current_track_idx = Some(idx);
                     track_path = path;
@@ -205,6 +210,30 @@ impl Player {
                     |_| (),
                 )
                 .discard()
+            }
+            Message::ChooseTrack((path, idx)) => {
+                if !self.playlist.is_some() {
+                    self.queue = self.tracks.clone();
+                    Task::perform(async move { return (path, idx) }, Message::PlayTrack)
+                } else {
+                    let pool = self.db_pool.clone();
+                    let uuid = &self.playlist.as_ref().unwrap().uuid;
+                    let playlist_uuid = Uuid::from_str(uuid).unwrap();
+
+                    let play_task = Task::perform(
+                        async move {
+                            return (path, idx);
+                        },
+                        Message::PlayTrack,
+                    );
+
+                    let set_queue_task = Task::perform(
+                        get_tracks_from_playlist(playlist_uuid, pool),
+                        Message::SetQueue,
+                    );
+
+                    Task::batch(vec![play_task, set_queue_task])
+                }
             }
             Message::ToggleTrack => {
                 if let None = self.current_track_idx {
@@ -238,13 +267,13 @@ impl Player {
                 }
 
                 let idx;
-                if self.current_track_idx.unwrap() + 1 > self.tracks.len() - 1 {
+                if self.current_track_idx.unwrap() + 1 > self.queue.len() - 1 {
                     idx = 0;
                 } else {
                     idx = self.current_track_idx.unwrap() + 1;
                 };
 
-                let prev_track = self.tracks.get(idx).unwrap();
+                let prev_track = self.queue.get(idx).unwrap();
                 let path = prev_track.path.clone();
                 self.current_track_idx = Some(idx);
                 Task::perform(
@@ -262,10 +291,10 @@ impl Player {
                 let idx = if let Some(idx) = self.current_track_idx.unwrap().checked_sub(1) {
                     idx
                 } else {
-                    self.tracks.len() - 1
+                    self.queue.len() - 1
                 };
 
-                let prev_track = self.tracks.get(idx).unwrap();
+                let prev_track = self.queue.get(idx).unwrap();
                 let path = prev_track.path.clone();
                 self.current_track_idx = Some(idx);
                 Task::perform(
@@ -276,19 +305,23 @@ impl Player {
                 )
             }
             Message::AddToQueue(idx) => {
-                let track = self.tracks[idx].clone();
+                let track = self.queue[idx].clone();
                 self.prio_queue.push_back(track);
                 if let None = self.current_track_idx {
                     self.current_track_idx = Some(idx);
                 }
                 Task::none()
             }
+            Message::SetQueue(tracks) => {
+                self.queue = tracks.unwrap();
+                Task::none()
+            }
             Message::Tick(now) => {
                 if let DurationBar::Ticking { last_tick } = &mut self.timer {
-                    let dur = if self.queue.len() > 0 {
-                        self.queue[0].duration
+                    let dur = if self.prio_queue.len() > 0 {
+                        self.prio_queue[0].duration
                     } else {
-                        self.tracks
+                        self.queue
                             .get(self.current_track_idx.unwrap())
                             .unwrap()
                             .duration
@@ -333,7 +366,7 @@ impl Player {
 
         let mut dur = 0.0;
         if let Some(idx) = self.current_track_idx {
-            let track = &self.tracks[idx];
+            let track = &self.queue[idx];
             dur = track.duration.as_secs_f32();
         } else {
             ()
@@ -431,4 +464,37 @@ impl SavedState {
             }
         }
     }
+}
+
+async fn get_tracks_from_playlist(
+    playlist_uuid: Uuid,
+    pool: SqlitePool,
+) -> Result<Vec<Track>, String> {
+    let mut res = vec![];
+    let tracks = db::get_tracks_from_playlist(&pool, playlist_uuid).await;
+    for track in tracks {
+        let track_metadata = Probe::open(&track.path)
+            .map_err(|_| LoadError::File)
+            .unwrap()
+            .read()
+            .map_err(|_| LoadError::File)
+            .unwrap();
+
+        let duration = track_metadata.properties().duration();
+        let duration_str = format!("{}:{}", duration.as_secs() / 60, duration.as_secs() % 60);
+
+        let uuid = Uuid::from_str(&track.uuid).unwrap();
+        let path = PathBuf::from_str(&track.path).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+        res.push(Track {
+            uuid,
+            name,
+            duration_str,
+            duration,
+            path,
+        });
+    }
+
+    Ok(res)
 }
