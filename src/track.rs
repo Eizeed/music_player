@@ -16,7 +16,7 @@ pub struct Track {
 
 #[derive(Debug, Clone)]
 pub enum TrackMessage {
-    PlayTrack,
+    ChooseTrack,
     AddToQueue,
     TrackEnd(Result<(), String>),
 }
@@ -24,7 +24,7 @@ pub enum TrackMessage {
 impl Track {
     pub fn update(&mut self, message: TrackMessage) -> Task<TrackMessage> {
         match message {
-            TrackMessage::PlayTrack => {
+            TrackMessage::ChooseTrack => {
                 println!("Play clicked");
                 let path = self.path.clone();
                 println!("{path:#?}");
@@ -45,7 +45,7 @@ impl Track {
         let duration = text(&self.duration_str).width(Length::FillPortion(1));
 
         let content = row![name, duration];
-        let track_data = button(content).on_press(TrackMessage::PlayTrack);
+        let track_data = button(content).on_press(TrackMessage::ChooseTrack);
 
         let add_button = button("+").on_press(TrackMessage::AddToQueue);
 
