@@ -12,8 +12,8 @@ use player::models::playlist_model::PlaylistModel;
 use sqlx::pool::PoolOptions;
 use sqlx::SqlitePool;
 
-use iced::widget::{button, center, column, container, keyed_column, progress_bar, row, text};
-use iced::Length::Fill;
+use iced::widget::{button, center, column, container, horizontal_space, keyed_column, progress_bar, row, text, Container, Row};
+use iced::Length::{self, Fill};
 use iced::{time, window, Element, Subscription, Task};
 use lofty::file::AudioFile;
 use lofty::probe::Probe;
@@ -177,13 +177,15 @@ impl Player {
             Message::Loaded(Ok(state)) => {
                 self.tracks = state.tracks;
                 self.playlists = state.playlists;
-                let tracks = self.tracks.clone();
+                self.init_queue = self.tracks.clone();
+                self.backward_queue = vec![];
+                self.queue = VecDeque::new();
 
-                Task::done(Message::SetQueue((Ok(tracks), 0)))
+                Task::none()
             }
             Message::Loaded(Err(_err)) => Task::none(),
             Message::TrackMessage(i, _uuid, track_message) => {
-                if let Some(track) = self.queue.get_mut(i) {
+                if let Some(track) = self.init_queue.get_mut(i) {
                     match track_message {
                         TrackMessage::ChooseTrack => {
                             let _ = track.update(track_message);
@@ -212,10 +214,13 @@ impl Player {
                     let uuid_str = &self.current_playlist.as_ref().unwrap().uuid;
                     let playlist_uuid = Uuid::from_str(uuid_str).unwrap();
 
-                    let set_queue_task = Task::perform( async move {
-                        let tracks = get_tracks_from_playlist(playlist_uuid, pool).await;
-                        return (tracks, idx);
-                    }, Message::SetQueue);
+                    let set_queue_task = Task::perform(
+                        async move {
+                            let tracks = get_tracks_from_playlist(playlist_uuid, pool).await;
+                            return (tracks, idx);
+                        },
+                        Message::SetQueue,
+                    );
                     let play_task = Task::done(Message::PlayTrack);
 
                     Task::batch(vec![play_task, set_queue_task])
@@ -312,7 +317,7 @@ impl Player {
             }
             Message::Tick(now) => {
                 if self.current_track.is_none() {
-                    return Task::none()
+                    return Task::none();
                 }
 
                 if let DurationBar::Ticking { last_tick } = &mut self.timer {
@@ -347,6 +352,7 @@ impl Player {
                 )
             }))
             .spacing(10)
+            .width(Length::FillPortion(5))
             .height(Fill)
             .into()
         } else {
@@ -355,22 +361,46 @@ impl Player {
                 .into()
         };
 
+        let mut playlists: Vec<Element<'_, Message>>  = vec![];
+        for playlist in &self.playlists {
+            playlists.push(container(text(playlist.title.clone())).into());
+        }
+
+        let playlist = Row::from_vec(playlists);
+
+        let playlists = container(column![
+            container(text("playlists")).padding([10, 0]),
+            playlist
+        ])
+            .width(Length::FillPortion(1))
+            .height(Length::Fill);
+
+        let content = row![playlists, tracks].width(Fill).height(Fill);
+
         let mut dur = 0.0;
         if let Some(track) = &self.current_track {
             dur = track.duration.as_secs_f32();
         };
 
         let control = container(column![
-            progress_bar(0.0..=dur, self.current_pos.as_secs_f32()),
             row![
+                horizontal_space().width(Length::FillPortion(1)),
+                progress_bar(0.0..=dur, self.current_pos.as_secs_f32()).height(15).width(Length::FillPortion(2)),
+                horizontal_space().width(Length::FillPortion(1)),
+            ],
+            row![
+                horizontal_space(),
                 button("<").on_press(Message::JumpToPrev),
                 button("||").on_press(Message::ToggleTrack),
                 button(">").on_press(Message::JumpToNext),
+                horizontal_space(),
             ]
+                .padding([10, 0])
             .spacing(50),
         ])
         .center_x(Fill);
-        let content = column![tracks, control].padding([10, 20]);
+
+        let content = column![content, control].padding([10, 20]);
         container(content).width(Fill).height(Fill).into()
     }
 
