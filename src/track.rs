@@ -1,9 +1,14 @@
-use std::{path::{Path, PathBuf}, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use iced::{widget::{button, horizontal_space, row, text}, Element, Length, Task};
+use iced::{
+    widget::{button, container, horizontal_space, row, text},
+    Element, Length, Task,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
@@ -29,36 +34,29 @@ impl Track {
                 let path = self.path.clone();
                 println!("{path:#?}");
                 Task::none()
-            },
+            }
             TrackMessage::AddToQueue => {
                 println!("Added to queue");
                 Task::none()
             }
-            TrackMessage::TrackEnd(_res) => {
-                Task::none()
-            }
+            TrackMessage::TrackEnd(_res) => Task::none(),
         }
     }
 
     pub fn view(&self) -> Element<TrackMessage> {
-        let name = text(&self.name).width(Length::FillPortion(2));
-        let duration = text(&self.duration_str).width(Length::FillPortion(1));
+        let name = button(text(&self.name))
+            .on_press(TrackMessage::ChooseTrack)
+            .width(Length::FillPortion(6));
 
-        let content = row![name, duration];
-        let track_data = button(content).on_press(TrackMessage::ChooseTrack);
+        let duration = text(&self.duration_str).width(Length::FillPortion(1)).center();
 
-        let add_button = button("+").on_press(TrackMessage::AddToQueue);
+        let add_button = container(button("+")
+            .on_press(TrackMessage::AddToQueue))
+            .width(Length::FillPortion(1))
+            .center_x(Length::Fill);
 
-        let track = row![track_data, horizontal_space(), add_button].into();
+        let content = row![name, duration, add_button].into();
 
-        return track;
+        return content;
     }
-
 }
-
-
-
-
-
-
-
