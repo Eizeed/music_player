@@ -12,7 +12,9 @@ use player::models::playlist_model::PlaylistModel;
 use sqlx::pool::PoolOptions;
 use sqlx::SqlitePool;
 
-use iced::widget::{button, center, column, container, horizontal_space, keyed_column, progress_bar, row, text, Container, Row};
+use iced::widget::{
+    button, center, column, container, horizontal_space, keyed_column, progress_bar, row, text,
+};
 use iced::Length::{self, Fill};
 use iced::{time, window, Element, Subscription, Task};
 use lofty::file::AudioFile;
@@ -22,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Sender};
 use uuid::Uuid;
 
-use player::{db, track::*};
+use player::{db, playlist::*, track::*};
 
 pub const HOME_PATH: &str = "/home/lf/Music";
 
@@ -57,8 +59,8 @@ struct Player {
     // prio_queue it will be here
     current_track: Option<Track>,
 
-    playlists: Vec<PlaylistModel>,
-    current_playlist: Option<PlaylistModel>,
+    playlists: Vec<Playlist>,
+    current_playlist: Option<Playlist>,
     current_pos: Duration, // Current time pos of track
 
     sender: Sender<Command>,
@@ -75,13 +77,13 @@ enum Command {
 #[derive(Debug, Clone)]
 enum Message {
     Loaded(Result<SavedState, LoadError>),
+    LoadPlaylist(Vec<Playlist>),
     TrackMessage(usize, Uuid, TrackMessage),
+    PlaylistMessage(usize, Uuid, PlaylistMessage),
     PlayTrack,
-    ChooseTrack(usize),
     ToggleTrack,
     JumpToNext,
     JumpToPrev,
-    AddToPrioQueue(usize),
     SetQueue((Result<Vec<Track>, String>, usize)),
     Tick(Instant),
     Err(Result<(), String>),
@@ -184,16 +186,100 @@ impl Player {
                 Task::none()
             }
             Message::Loaded(Err(_err)) => Task::none(),
+            Message::LoadPlaylist(playlists) => {
+                self.playlists = playlists;
+                Task::none()
+            }
             Message::TrackMessage(i, _uuid, track_message) => {
                 if let Some(track) = self.init_queue.get_mut(i) {
                     match track_message {
                         TrackMessage::ChooseTrack => {
                             let _ = track.update(track_message);
-                            Task::done(Message::ChooseTrack(i))
+                            if !self.current_playlist.is_some() {
+                                let tracks = self.tracks.clone();
+
+                                let set_queue_task = Task::done(Message::SetQueue((Ok(tracks), i)));
+                                let play_task = Task::done(Message::PlayTrack);
+
+                                Task::batch(vec![set_queue_task, play_task])
+                            } else {
+                                let pool = self.db_pool.clone();
+                                let playlist_uuid = self.current_playlist.as_ref().unwrap().uuid.clone();
+
+                                let set_queue_task = Task::perform(
+                                    async move {
+                                        let tracks =
+                                            get_tracks_from_playlist(playlist_uuid, pool).await;
+                                        return (tracks, i);
+                                    },
+                                    Message::SetQueue,
+                                );
+                                let play_task = Task::done(Message::PlayTrack);
+
+                                Task::batch(vec![play_task, set_queue_task])
+                            }
                         }
                         TrackMessage::AddToQueue => {
                             let _ = track.update(track_message);
-                            Task::done(Message::AddToPrioQueue(i))
+                            self.prio_queue.push_back(track.clone());
+
+                            Task::none()
+                        }
+                        TrackMessage::OpenPlaylistMenu(_playlist) => {
+                            let _ = track
+                                .update(TrackMessage::OpenPlaylistMenu(self.playlists.clone()));
+                            Task::none()
+                        }
+                        TrackMessage::ClosePlaylistMenu => {
+                            let _ = track.update(track_message);
+                            Task::none()
+                        }
+                        TrackMessage::ToggleInPlaylist(playlist) => {
+                            let tracks = playlist.tracks.clone();
+                            let _ = track.update(TrackMessage::ToggleInPlaylist(playlist.clone()));
+                            let pool = self.db_pool.clone();
+                            let track_uuid = track.uuid.clone();
+
+                            let db_task;
+
+                            let exists = tracks.iter().find(|uuid| **uuid == track_uuid);
+                            if exists.is_some() {
+                                println!("DELETE FROM PLAYLIST");
+                                db_task = Task::perform(
+                                    async move {
+                                        let playlist_models =
+                                            db::delete_from_playlist(&pool, playlist, track_uuid)
+                                                .await;
+                                        let playlists: Vec<Playlist> = playlist_models
+                                            .into_iter()
+                                            .map(Playlist::from)
+                                            .collect();
+                                        return playlists;
+                                    },
+                                    Message::LoadPlaylist,
+                                )
+                            } else {
+                                println!("INSERT INTO PLAYLIST");
+                                db_task = Task::perform(
+                                    async move {
+                                        let playlist_models =
+                                            db::insert_into_playlist(&pool, playlist, track_uuid)
+                                                .await;
+                                        let playlists: Vec<Playlist> = playlist_models
+                                            .into_iter()
+                                            .map(Playlist::from)
+                                            .collect();
+                                        return playlists;
+                                    },
+                                    Message::LoadPlaylist,
+                                )
+                            }
+
+                            db_task.chain(Task::done(Message::TrackMessage(
+                                i,
+                                _uuid,
+                                TrackMessage::OpenPlaylistMenu(self.playlists.clone()),
+                            )))
                         }
                         TrackMessage::TrackEnd(_) => Task::none(),
                     }
@@ -201,31 +287,74 @@ impl Player {
                     Task::none()
                 }
             }
-            Message::ChooseTrack(idx) => {
-                if !self.current_playlist.is_some() {
-                    let tracks = self.tracks.clone();
-
-                    let set_queue_task = Task::done(Message::SetQueue((Ok(tracks), idx)));
-                    let play_task = Task::done(Message::PlayTrack);
-
-                    Task::batch(vec![set_queue_task, play_task])
-                } else {
+            Message::PlaylistMessage(i, uuid, playlist_message) => match playlist_message {
+                PlaylistMessage::SelectPlaylist => {
+                    println!("selected");
                     let pool = self.db_pool.clone();
-                    let uuid_str = &self.current_playlist.as_ref().unwrap().uuid;
-                    let playlist_uuid = Uuid::from_str(uuid_str).unwrap();
 
-                    let set_queue_task = Task::perform(
-                        async move {
-                            let tracks = get_tracks_from_playlist(playlist_uuid, pool).await;
-                            return (tracks, idx);
+                    match &self.current_playlist {
+                        Some(playlist) => {
+                            println!("Current playlist.uuid: {}", playlist.uuid);
+                            if playlist.uuid == uuid {
+                                self.current_playlist = None;
+                            } else {
+                                self.current_playlist = Some(self.playlists[i].clone());
+                            }
                         },
-                        Message::SetQueue,
-                    );
-                    let play_task = Task::done(Message::PlayTrack);
+                        None => {
+                            println!("No playlist");
+                            self.current_playlist = Some(self.playlists[i].clone());
+                        }
+                    }
 
-                    Task::batch(vec![play_task, set_queue_task])
+                    if self.current_playlist.is_some() {
+                        Task::perform(
+                            async move {
+                                let track_models = db::get_tracks_from_playlist(&pool, uuid).await;
+                                let tracks: Vec<Track> = track_models
+                                    .into_iter()
+                                    .map(|track| {
+                                        let track_metadata = Probe::open(&track.path)
+                                            .map_err(|_| LoadError::File)
+                                            .unwrap()
+                                            .read()
+                                            .map_err(|_| LoadError::File)
+                                            .unwrap();
+
+                                        let duration = track_metadata.properties().duration();
+                                        let duration_str = format!(
+                                            "{}:{}",
+                                            duration.as_secs() / 60,
+                                            duration.as_secs() % 60
+                                        );
+
+                                        let uuid = Uuid::from_str(&track.uuid).unwrap();
+                                        let path = PathBuf::from_str(&track.path).unwrap();
+                                        let name =
+                                        path.file_name().unwrap().to_str().unwrap().to_string();
+
+                                        Track {
+                                            uuid,
+                                            name,
+                                            duration_str,
+                                            duration,
+                                            path,
+                                            playlists: None,
+                                        }
+                                    })
+                                    .collect();
+
+                                return (Ok(tracks), 0);
+                            },
+                            Message::SetQueue,
+                        )
+                    } else {
+                        Task::done(Message::SetQueue((Ok(self.tracks.clone()), 0)))
+                    }
+
                 }
-            }
+                _ => Task::none(),
+            },
             Message::PlayTrack => {
                 let sender = self.sender.clone();
 
@@ -301,13 +430,8 @@ impl Player {
 
                 Task::done(Message::PlayTrack)
             }
-            Message::AddToPrioQueue(idx) => {
-                let track = self.init_queue[idx].clone();
-                self.prio_queue.push_back(track);
-
-                Task::none()
-            }
             Message::SetQueue((tracks, idx)) => {
+                println!("Tracks for init queue: {tracks:#?}");
                 self.init_queue = tracks.unwrap();
                 self.backward_queue = self.init_queue.clone().into();
                 self.queue = self.backward_queue.split_off(idx).into();
@@ -361,19 +485,20 @@ impl Player {
                 .into()
         };
 
-        let mut playlists: Vec<Element<'_, Message>>  = vec![];
-        for playlist in &self.playlists {
-            playlists.push(container(text(playlist.title.clone())).into());
-        }
-
-        let playlist = Row::from_vec(playlists);
-
         let playlists = container(column![
             container(text("playlists")).padding([10, 0]),
-            playlist
+            keyed_column(self.playlists.iter().enumerate().map(|(i, playlist)| {
+                let uuid = playlist.uuid;
+                (
+                    playlist.uuid,
+                    playlist
+                        .view()
+                        .map(move |message| Message::PlaylistMessage(i, uuid, message)),
+                )
+            }))
         ])
-            .width(Length::FillPortion(1))
-            .height(Length::Fill);
+        .width(Length::FillPortion(1))
+        .height(Length::Fill);
 
         let content = row![playlists, tracks].width(Fill).height(Fill);
 
@@ -385,7 +510,9 @@ impl Player {
         let control = container(column![
             row![
                 horizontal_space().width(Length::FillPortion(1)),
-                progress_bar(0.0..=dur, self.current_pos.as_secs_f32()).height(15).width(Length::FillPortion(2)),
+                progress_bar(0.0..=dur, self.current_pos.as_secs_f32())
+                    .height(15)
+                    .width(Length::FillPortion(2)),
                 horizontal_space().width(Length::FillPortion(1)),
             ],
             row![
@@ -395,7 +522,7 @@ impl Player {
                 button(">").on_press(Message::JumpToNext),
                 horizontal_space(),
             ]
-                .padding([10, 0])
+            .padding([10, 0])
             .spacing(50),
         ])
         .center_x(Fill);
@@ -425,7 +552,7 @@ pub enum LoadError {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SavedState {
     tracks: Vec<Track>,
-    playlists: Vec<PlaylistModel>,
+    playlists: Vec<Playlist>,
 }
 
 impl SavedState {
@@ -437,7 +564,11 @@ impl SavedState {
         db::init(&pool).await;
         db::update_track_state(&pool, &paths).await;
         let track_md_vec = db::get_tracks(&pool).await;
-        let playlists = db::get_playlists(&pool).await;
+        let playlists = db::get_playlists(&pool)
+            .await
+            .into_iter()
+            .map(Playlist::from)
+            .collect();
 
         for track in track_md_vec {
             let track_metadata = Probe::open(&track.path)
@@ -458,6 +589,7 @@ impl SavedState {
                 duration_str,
                 duration,
                 path,
+                playlists: None,
             });
         }
 
@@ -511,6 +643,7 @@ async fn get_tracks_from_playlist(
             duration_str,
             duration,
             path,
+            playlists: None,
         });
     }
 

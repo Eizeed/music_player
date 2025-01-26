@@ -4,11 +4,14 @@ use std::{
 };
 
 use iced::{
-    widget::{button, container, horizontal_space, row, text},
+    overlay,
+    widget::{button, checkbox, container, horizontal_space, row, text, Column},
     Element, Length, Task,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::playlist::{self, Playlist};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
@@ -17,11 +20,15 @@ pub struct Track {
     pub duration_str: String,
     pub duration: Duration,
     pub path: PathBuf,
+    pub playlists: Option<Vec<Playlist>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum TrackMessage {
     ChooseTrack,
+    OpenPlaylistMenu(Vec<Playlist>),
+    ClosePlaylistMenu,
+    ToggleInPlaylist(Playlist),
     AddToQueue,
     TrackEnd(Result<(), String>),
 }
@@ -33,6 +40,17 @@ impl Track {
                 println!("Play clicked");
                 let path = self.path.clone();
                 println!("{path:#?}");
+                Task::none()
+            }
+            TrackMessage::OpenPlaylistMenu(playlists) => {
+                self.playlists = Some(playlists);
+                Task::none()
+            }
+            TrackMessage::ClosePlaylistMenu => {
+                self.playlists = None;
+                Task::none()
+            }
+            TrackMessage::ToggleInPlaylist(playlist) => {
                 Task::none()
             }
             TrackMessage::AddToQueue => {
@@ -48,14 +66,34 @@ impl Track {
             .on_press(TrackMessage::ChooseTrack)
             .width(Length::FillPortion(6));
 
-        let duration = text(&self.duration_str).width(Length::FillPortion(1)).center();
+        let duration = text(&self.duration_str)
+            .width(Length::FillPortion(1))
+            .center();
 
-        let add_button = container(button("+")
-            .on_press(TrackMessage::AddToQueue))
+        let add_button = container(button("+").on_press(TrackMessage::AddToQueue))
             .width(Length::FillPortion(1))
             .center_x(Length::Fill);
 
-        let content = row![name, duration, add_button].into();
+        let add_to_liked = container(button("<3").on_press(TrackMessage::OpenPlaylistMenu(vec![])))
+            .width(Length::FillPortion(1))
+            .center_x(Length::Fill);
+
+        let mut playlist_container: Vec<Element<'_, TrackMessage>> = vec![];
+        if let Some(playlists) = &self.playlists {
+            for playlist in playlists {
+                playlist_container.push(
+                    button(playlist.title.as_ref())
+                        .on_press(TrackMessage::ToggleInPlaylist(playlist.clone()))
+                        .into(),
+                );
+            }
+        }
+
+        let playlist_container = container(Column::from_vec(playlist_container));
+
+        let buttons = row![add_button, add_to_liked];
+
+        let content = row![name, duration, buttons, playlist_container].into();
 
         return content;
     }
