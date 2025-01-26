@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use crate::{
     models::{playlist_model::*, track_model::TrackModel},
+    playlist::Playlist,
+    track::Track,
     utils::path_buf_vec_to_string,
 };
 use serde_json::Value;
@@ -136,12 +138,13 @@ pub async fn get_playlists(pool: &SqlitePool) -> Vec<PlaylistModel> {
 
 pub async fn get_tracks_from_playlist(pool: &SqlitePool, playlist_uuid: Uuid) -> Vec<TrackModel> {
     let mut transaction = pool.begin().await.unwrap();
+    let uuid = playlist_uuid.to_string();
     let playlist = sqlx::query_as!(
         PlaylistModel,
         r#"
             SELECT uuid, title, tracks AS "tracks: Value" FROM playlists WHERE uuid = $1 
         "#,
-        playlist_uuid
+        uuid
     )
     .fetch_one(transaction.as_mut())
     .await
@@ -152,18 +155,72 @@ pub async fn get_tracks_from_playlist(pool: &SqlitePool, playlist_uuid: Uuid) ->
     let mut tracks: Vec<TrackModel> = vec![];
 
     for uuid in uuids {
+        let uuid = uuid.to_string();
         let track = sqlx::query_as!(
             TrackModel,
             r#"
                 SELECT * FROM tracks WHERE uuid = $1
             "#,
             uuid
-        ).fetch_one(transaction.as_mut()).await.unwrap();
+        )
+        .fetch_one(transaction.as_mut())
+        .await
+        .unwrap();
 
         tracks.push(track);
-    };
+    }
 
     transaction.commit().await.unwrap();
 
     return tracks;
+}
+
+pub async fn insert_into_playlist(pool: &SqlitePool, mut playlist: Playlist, track_uuid: Uuid) -> Vec<PlaylistModel> {
+    playlist.tracks.push(track_uuid);
+    let tracks = serde_json::to_value(playlist.tracks).unwrap();
+    let uuid = playlist.uuid.to_string();
+
+    sqlx::query!(
+        r#"
+            UPDATE playlists 
+            SET
+                tracks = $1
+            WHERE 
+                uuid = $2
+        "#,
+        tracks,
+        uuid,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    return get_playlists(pool).await;
+}
+pub async fn delete_from_playlist(pool: &SqlitePool, mut playlist: Playlist, track_uuid: Uuid) -> Vec<PlaylistModel> {
+    for (i, uuid) in playlist.tracks.iter().enumerate() {
+        if *uuid == track_uuid {
+            playlist.tracks.remove(i);
+            break;
+        }
+    }
+
+    let tracks = serde_json::to_value(playlist.tracks).unwrap();
+    let uuid = playlist.uuid.to_string();
+    sqlx::query!(
+        r#"
+            UPDATE playlists 
+            SET
+                tracks = $1
+            WHERE 
+                uuid = $2
+        "#,
+        tracks,
+        uuid,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    return get_playlists(pool).await;
 }
